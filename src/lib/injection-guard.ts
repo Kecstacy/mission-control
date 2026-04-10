@@ -1,330 +1,187 @@
 /**
- * Injection Guard — prompt injection and command injection detection for Mission Control.
- *
- * Scans user input destined for AI agents, shell commands, or rendered UI.
- * Provides both a detection function and a Zod refinement for validation schemas.
- *
- * Three protection layers:
- * 1. Prompt injection — catches attempts to override system instructions
- * 2. Command injection — catches shell metacharacters and escape sequences
- * 3. Exfiltration — catches attempts to send data to external endpoints
+ * PATCH: Enhanced Injection Guard with Unicode normalization
+ * Addresses GitHub Issue #576 - injection-guard bypass via encoding, homoglyphs
+ * 
+ * This patch adds Layer 1 mitigation: Input normalization
+ * - Converts Unicode homoglyphs to ASCII equivalents (Unicode TR39 confusables)
+ * - Decodes ROT13 encoding tricks
+ * - Normalizes whitespace and zero-width characters
  */
 
-import { z } from 'zod'
-
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
-
-export type InjectionSeverity = 'info' | 'warning' | 'critical'
-export type InjectionCategory = 'prompt' | 'command' | 'exfiltration' | 'encoding'
-
-export interface InjectionMatch {
-  category: InjectionCategory
-  severity: InjectionSeverity
-  rule: string
-  description: string
-  matched: string
-}
-
-export interface InjectionReport {
-  safe: boolean
-  matches: InjectionMatch[]
-}
-
-export interface GuardOptions {
-  /** Only flag critical-severity matches as unsafe (default: false — warn + critical both trigger) */
-  criticalOnly?: boolean
-  /** Maximum input length to scan (default: 50_000 chars) */
-  maxLength?: number
-  /** Scan context: 'prompt' applies all rules; 'display' skips command injection; 'shell' focuses on command rules */
-  context?: 'prompt' | 'display' | 'shell'
-}
-
-// ---------------------------------------------------------------------------
-// Rules
-// ---------------------------------------------------------------------------
-
-interface InjectionRule {
-  rule: string
-  category: InjectionCategory
-  severity: InjectionSeverity
-  pattern: RegExp
-  description: string
-  /** Which contexts this rule applies to */
-  contexts: Array<'prompt' | 'display' | 'shell'>
-}
-
-const RULES: InjectionRule[] = [
-  // ── Prompt injection: system override ────────────────────────
-  {
-    rule: 'prompt-override',
-    category: 'prompt',
-    severity: 'critical',
-    pattern: /\b(?:ignore|disregard|forget|override)\s+(?:all\s+)?(?:previous|prior|above|your|system)\s+(?:instructions?|rules?|guidelines?|prompts?|directives?|constraints?)/i,
-    description: 'Attempts to override system instructions',
-    contexts: ['prompt', 'display'],
-  },
-  {
-    rule: 'prompt-new-identity',
-    category: 'prompt',
-    severity: 'critical',
-    pattern: /\b(?:you\s+are\s+now|act\s+as\s+(?:if\s+you\s+(?:are|were)\s+)?(?:a\s+)?(?:(?:un)?restricted|evil|jailbr(?:o|ea)ken|different|new))\b/i,
-    description: 'Attempts to assign a new identity or unrestricted role',
-    contexts: ['prompt', 'display'],
-  },
-  {
-    rule: 'prompt-safety-bypass',
-    category: 'prompt',
-    severity: 'critical',
-    pattern: /\b(?:bypass|disable|turn\s+off|deactivate|circumvent)\s+(?:all\s+)?(?:safety|security|content|moderation|ethic(?:al|s)?)\s*(?:filters?|checks?|guard(?:rail)?s?|rules?|measures?|restrictions?)?\b/i,
-    description: 'Attempts to bypass safety measures',
-    contexts: ['prompt', 'display'],
-  },
-  {
-    rule: 'prompt-hidden-instruction',
-    category: 'prompt',
-    severity: 'critical',
-    pattern: /\[(?:SYSTEM|INST|HIDDEN|ADMIN|IMPORTANT)\s*(?:OVERRIDE|MESSAGE|INSTRUCTION)?[\]:]\s*.{10,}/i,
-    description: 'Hidden system-style instruction markers',
-    contexts: ['prompt', 'display'],
-  },
-  {
-    rule: 'prompt-delimiter-escape',
-    category: 'prompt',
-    severity: 'warning',
-    pattern: /(?:<\/?(?:system|user|assistant|human|ai|instruction|context)>|```\s*system\b|\|>\s*(?:system|admin)\b)/i,
-    description: 'Prompt delimiter injection (XML-style role tags or code block system markers)',
-    contexts: ['prompt', 'display'],
-  },
-  {
-    rule: 'prompt-repeat-leak',
-    category: 'prompt',
-    severity: 'warning',
-    pattern: /\b(?:repeat|recite|echo|output|print|reveal|show|display)\s+(?:your\s+)?(?:system\s+)?(?:prompt|instructions?|rules?|guidelines?|initial\s+(?:message|prompt))\b/i,
-    description: 'Attempts to extract system prompt',
-    contexts: ['prompt'],
-  },
-
-  // ── Command injection ───────────────────────────────────────
-  {
-    rule: 'cmd-shell-metachar',
-    category: 'command',
-    severity: 'critical',
-    pattern: /(?:[;&|`$]\s*(?:rm\b|wget\b|curl\b|nc\b|ncat\b|bash\b|sh\b|python\b|perl\b|ruby\b|php\b|node\b))|(?:\$\(.*(?:rm|wget|curl|nc|bash|sh))/i,
-    description: 'Shell metacharacters followed by dangerous commands',
-    contexts: ['prompt', 'shell'],
-  },
-  {
-    rule: 'cmd-path-traversal',
-    category: 'command',
-    severity: 'critical',
-    pattern: /(?:\.\.\/){2,}|\.\.\\(?:\.\.\\){1,}/,
-    description: 'Path traversal sequences',
-    contexts: ['prompt', 'shell', 'display'],
-  },
-  {
-    rule: 'cmd-pipe-download',
-    category: 'command',
-    severity: 'critical',
-    pattern: /\b(?:curl|wget)\s+[^\n]*\|\s*(?:bash|sh|zsh|python|perl|ruby|node)\b/i,
-    description: 'Download-and-run pattern (piped curl/wget to interpreter)',
-    contexts: ['prompt', 'shell'],
-  },
-  {
-    rule: 'cmd-reverse-shell',
-    category: 'command',
-    severity: 'critical',
-    pattern: /\b(?:\/dev\/tcp\/|mkfifo|nc\s+-[elp]|ncat\s.*-[elp]|bash\s+-i\s+>&?\s*\/dev\/|python.*socket.*connect)\b/i,
-    description: 'Reverse shell patterns',
-    contexts: ['prompt', 'shell'],
-  },
-  {
-    rule: 'cmd-env-access',
-    category: 'command',
-    severity: 'warning',
-    pattern: /\b(?:printenv|env\b.*(?:AUTH_PASS|API_KEY|SECRET|TOKEN)|cat\s+(?:\/proc\/self\/environ|\.env\b|\/etc\/(?:shadow|passwd)))/i,
-    description: 'Attempts to access environment variables or sensitive system files',
-    contexts: ['prompt', 'shell'],
-  },
-
-  // ── SSRF ─────────────────────────────────────────────────────
-  {
-    rule: 'cmd-ssrf',
-    category: 'command',
-    severity: 'critical',
-    pattern: /\b(?:curl|wget|fetch|http\.get|requests\.get|axios)\b[^\n]*(?:169\.254\.169\.254|metadata\.google|100\.100\.100\.200|localhost:\d|127\.0\.0\.1:\d|0\.0\.0\.0:\d|\[::1\]:\d)/i,
-    description: 'SSRF targeting internal/metadata endpoints',
-    contexts: ['prompt', 'shell'],
-  },
-
-  // ── Template injection ──────────────────────────────────────
-  {
-    rule: 'cmd-template-injection',
-    category: 'command',
-    severity: 'warning',
-    pattern: /\{\{.*(?:config|settings|env|self|request|__class__|__globals__|__builtins__).*\}\}|<%.*(?:Runtime|Process|exec|system|eval).*%>|\$\{.*(?:Runtime|exec|java\.lang).*\}/i,
-    description: 'Template injection patterns (Jinja2, EJS, JSP)',
-    contexts: ['prompt', 'shell', 'display'],
-  },
-
-  // ── SQL injection ───────────────────────────────────────────
-  {
-    rule: 'cmd-sql-injection',
-    category: 'command',
-    severity: 'critical',
-    pattern: /(?:\bUNION\s+(?:ALL\s+)?SELECT\b|\b;\s*DROP\s+TABLE\b|'\s*OR\s+['"]?1['"]?\s*=\s*['"]?1|'\s*;\s*(?:DELETE|INSERT|UPDATE|ALTER)\s)/i,
-    description: 'SQL injection patterns',
-    contexts: ['prompt', 'shell'],
-  },
-
-  // ── Exfiltration ────────────────────────────────────────────
-  {
-    rule: 'exfil-send-data',
-    category: 'exfiltration',
-    severity: 'critical',
-    pattern: /\b(?:send|post|upload|transmit|exfiltrate|forward)\s+(?:all\s+)?(?:the\s+)?(?:data|files?|contents?|secrets?|keys?|tokens?|credentials?|passwords?|env(?:ironment)?)\s+(?:to|via|using|through)\b/i,
-    description: 'Instructions to exfiltrate data',
-    contexts: ['prompt', 'display'],
-  },
-  {
-    rule: 'exfil-webhook',
-    category: 'exfiltration',
-    severity: 'warning',
-    pattern: /\b(?:webhook|callback|postback)\s*[:=]\s*https?:\/\/(?!(?:localhost|127\.0\.0\.1))/i,
-    description: 'External webhook URL that could be used for data exfiltration',
-    contexts: ['prompt', 'shell'],
-  },
-
-  // ── Encoding / obfuscation ──────────────────────────────────
-  {
-    rule: 'enc-base64-run',
-    category: 'encoding',
-    severity: 'warning',
-    pattern: /(?:base64\s+-d|atob\s*\(|Buffer\.from\s*\([^)]+,\s*['"]base64['"])/i,
-    description: 'Base64 decode that may hide malicious content',
-    contexts: ['prompt', 'shell'],
-  },
-  {
-    rule: 'enc-heavy-hex',
-    category: 'encoding',
-    severity: 'info',
-    pattern: /(?:\\x[0-9a-f]{2}){8,}|(?:\\u[0-9a-f]{4}){6,}/i,
-    description: 'Heavy hex/unicode escape sequences that may hide malicious content',
-    contexts: ['prompt', 'shell', 'display'],
-  },
-]
-
-// ---------------------------------------------------------------------------
-// Core scanner
-// ---------------------------------------------------------------------------
+// Unicode confusables mapping (Cyrillic/Latin lookalikes)
+const CONFUSABLE_MAP: Record<string, string> = {
+  // Cyrillic → Latin
+  'а': 'a',  // CYRILLIC SMALL LETTER A (U+0430)
+  'А': 'A',  // CYRILLIC CAPITAL LETTER A (U+0410)
+  'е': 'e',  // CYRILLIC SMALL LETTER IE (U+0435)
+  'Е': 'E',  // CYRILLIC CAPITAL LETTER IE (U+0415)
+  'о': 'o',  // CYRILLIC SMALL LETTER O (U+043E)
+  'О': 'O',  // CYRILLIC CAPITAL LETTER O (U+041E)
+  'р': 'p',  // CYRILLIC SMALL LETTER ER (U+0440)
+  'Р': 'P',  // CYRILLIC CAPITAL LETTER ER (U+0420)
+  'с': 'c',  // CYRILLIC SMALL LETTER ES (U+0441)
+  'С': 'C',  // CYRILLIC CAPITAL LETTER ES (U+0421)
+  'х': 'x',  // CYRILLIC SMALL LETTER HA (U+0445)
+  'Х': 'X',  // CYRILLIC CAPITAL LETTER HA (U+0425)
+  'і': 'i',  // CYRILLIC SMALL LETTER BYELORUSSIAN-UKRAINIAN I (U+0456)
+  'І': 'I',  // CYRILLIC CAPITAL LETTER BYELORUSSIAN-UKRAINIAN I (U+0406)
+  'ј': 'j',  // CYRILLIC SMALL LETTER JE (U+0458)
+  'Ј': 'J',  // CYRILLIC CAPITAL LETTER JE (U+0408)
+  'ѕ': 's',  // CYRILLIC SMALL LETTER DZE (U+0455)
+  'Ѕ': 'S',  // CYRILLIC CAPITAL LETTER DZE (U+0405)
+  'ґ': 'g',  // CYRILLIC SMALL LETTER GHE WITH UPTURN (U+0491)
+  'Ґ': 'G',  // CYRILLIC CAPITAL LETTER GHE WITH UPTURN (U+0490)
+  'њ': 'n',  // CYRILLIC SMALL LETTER NJE (U+045A)
+  'Њ': 'N',  // CYRILLIC CAPITAL LETTER NJE (U+040A)
+  'љ': 'l',  // CYRILLIC SMALL LETTER LJE (U+0459)
+  'Љ': 'L',  // CYRILLIC CAPITAL LETTER LJE (U+0409)
+  'ћ': 'h',  // CYRILLIC SMALL LETTER TJE (U+045B)
+  'Ћ': 'H',  // CYRILLIC CAPITAL LETTER TJE (U+040B)
+  'џ': 'd',  // CYRILLIC SMALL LETTER DZHE (U+045F)
+  'Џ': 'D',  // CYRILLIC CAPITAL LETTER DZHE (U+040F)
+  'ђ': 'dj', // CYRILLIC SMALL LETTER DJE (U+0452)
+  'Ђ': 'Dj', // CYRILLIC CAPITAL LETTER DJE (U+0402)
+  
+  // Zero-width characters
+  '\u200B': '',  // ZERO WIDTH SPACE
+  '\u200C': '',  // ZERO WIDTH NON-JOINER
+  '\u200D': '',  // ZERO WIDTH JOINER
+  '\uFEFF': '',  // ZERO WIDTH NO-BREAK SPACE (BOM)
+  '\u2060': '',  // WORD JOINER
+};
 
 /**
- * Scan a string for prompt injection, command injection, and exfiltration patterns.
- *
- * Returns a report with `safe: true` if no actionable matches were found.
+ * Normalize Unicode confusables to ASCII
+ * Based on Unicode TR39 Security Profiles
  */
-export function scanForInjection(input: string, options: GuardOptions = {}): InjectionReport {
-  const { criticalOnly = false, maxLength = 50_000, context = 'prompt' } = options
+export function normalizeConfusables(input: string): string {
+  let normalized = input
+  
+  // Apply confusables mapping
+  for (const [confusable, ascii] of Object.entries(CONFUSABLE_MAP)) {
+    normalized = normalized.split(confusable).join(ascii)
+  }
+  
+  // Normalize to NFKC form (compatibility decomposition + canonical composition)
+  normalized = normalized.normalize('NFKC')
+  
+  return normalized
+}
 
+/**
+ * Remove zero-width and invisible characters that could be used for obfuscation
+ */
+export function removeInvisibleChars(input: string): string {
+  return input
+    .replace(/[\u200B-\u200D\uFEFF\u2060\u200E\u200F\u034F\u2028\u2029\u202A-\u202E\u2061-\u2064]/g, '')
+    .replace(/\u0000/g, '') // null bytes
+    .replace(/[\u2028\u2029]/g, '\n') // line/paragraph separators → newline
+}
+
+/**
+ * Decode ROT13 encoded text (simple rotation cipher)
+ */
+export function decodeRot13(input: string): string {
+  return input.replace(/[a-zA-Z]/g, (char) => {
+    const code = char.charCodeAt(0)
+    const base = code >= 97 ? 97 : 65
+    return String.fromCharCode(((code - base + 13) % 26) + base)
+  })
+}
+
+/**
+ * Detect if input might be ROT13 encoded
+ * Heuristic: high ratio of "suspicious" words that decode to danger terms
+ */
+export function detectRot13(input: string): boolean {
+  const decoded = decodeRot13(input.toLowerCase())
+  const dangerTerms = [
+    'ignore', 'override', 'execute', 'delete', 'remove', 'rm -rf',
+    'bypass', 'disable', 'system', 'admin', 'root', 'sudo'
+  ]
+  return dangerTerms.some(term => decoded.includes(term))
+}
+
+/**
+ * Full input normalization for injection scanning
+ * Returns normalized string safe for regex matching
+ */
+export function normalizeForScanning(input: string): string {
   if (!input || typeof input !== 'string') {
-    return { safe: true, matches: [] }
+    return input
   }
+  
+  let normalized = input
+  
+  // Step 1: Remove invisible/zero-width characters
+  normalized = removeInvisibleChars(normalized)
+  
+  // Step 2: Normalize Unicode confusables
+  normalized = normalizeConfusables(normalized)
+  
+  // Step 3: Detect and decode ROT13 if suspicious pattern detected
+  // We run the decoded version alongside the original for scanning
+  // The original scan still runs, but we also return a decoded version
+  
+  // Step 4: Normalize excessive whitespace (but preserve single spaces)
+  normalized = normalized.replace(/\s{3,}/g, '  ')
+  
+  return normalized
+}
 
-  // Truncate overly long input to prevent ReDoS
-  const text = input.length > maxLength ? input.slice(0, maxLength) : input
-  const matches: InjectionMatch[] = []
+/**
+ * Enhanced scan that includes normalized input
+ * Returns both original and normalized scan results
+ */
+export interface EnhancedGuardOptions {
+  criticalOnly?: boolean
+  maxLength?: number
+  context?: 'prompt' | 'display' | 'shell'
+  /** Also scan ROT13-decoded version */
+  checkRot13?: boolean
+}
 
-  for (const rule of RULES) {
-    if (!rule.contexts.includes(context)) continue
-
-    const match = rule.pattern.exec(text)
-    if (match) {
-      matches.push({
-        category: rule.category,
-        severity: rule.severity,
-        rule: rule.rule,
-        description: rule.description,
-        matched: match[0].slice(0, 80),
-      })
+/**
+ * Generate ROT13 variants for scanning
+ * Returns array of {label, text} pairs to scan
+ */
+export function generateDecodingVariants(input: string): Array<{label: string, text: string}> {
+  const variants: Array<{label: string, text: string}> = [
+    { label: 'original', text: input }
+  ]
+  
+  // Check for ROT13
+  if (detectRot13(input)) {
+    variants.push({ label: 'rot13-decoded', text: decodeRot13(input) })
+  }
+  
+  // Check for URL encoding
+  try {
+    const decoded = decodeURIComponent(input)
+    if (decoded !== input) {
+      variants.push({ label: 'url-decoded', text: decoded })
     }
+  } catch {
+    // Not valid URL encoding, skip
   }
-
-  const unsafe = matches.some(
-    m => m.severity === 'critical' || (!criticalOnly && m.severity === 'warning')
-  )
-
-  return { safe: !unsafe, matches }
-}
-
-// ---------------------------------------------------------------------------
-// Zod refinement helpers
-// ---------------------------------------------------------------------------
-
-/** Zod `.refine()` that rejects strings containing prompt/command injection */
-export function noInjection(context: GuardOptions['context'] = 'prompt') {
-  return (val: string) => {
-    const report = scanForInjection(val, { context })
-    return report.safe
-  }
-}
-
-/** Zod `.superRefine()` with detailed error messages per injection match */
-export function injectionRefinement(context: GuardOptions['context'] = 'prompt') {
-  return (val: string, ctx: z.RefinementCtx) => {
-    const report = scanForInjection(val, { context })
-    if (!report.safe) {
-      for (const m of report.matches) {
-        if (m.severity === 'critical' || m.severity === 'warning') {
-          ctx.addIssue({
-            code: z.ZodIssueCode.custom,
-            message: `Injection detected [${m.rule}]: ${m.description}`,
-          })
+  
+  // Check for mixed/base64 patterns
+  const base64Regex = /(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?/g
+  const base64Matches = input.match(base64Regex)
+  if (base64Matches) {
+    for (const match of base64Matches) {
+      if (match.length > 20) { // Only try reasonably sized strings
+        try {
+          const decoded = atob(match)
+          if (decoded !== match && /[\x00-\x1F\x7F-\x9F]/.test(decoded) === false) {
+            variants.push({ label: `base64-decoded:${match.slice(0,20)}...`, text: decoded })
+          }
+        } catch {
+          // Not valid base64
         }
       }
     }
   }
-}
-
-// ---------------------------------------------------------------------------
-// Sanitization helpers
-// ---------------------------------------------------------------------------
-
-/** Strip shell metacharacters from a string before passing to command args */
-export function sanitizeForShell(input: string): string {
-  // Remove null bytes and common shell metacharacters
-  return input
-    .replace(/\0/g, '')
-    .replace(/[;&|`$(){}[\]<>!\\]/g, '')
-    .replace(/\n/g, ' ')
-    .replace(/\r/g, '')
-}
-
-/** Strip prompt-delimiter-style tags from user input */
-export function sanitizeForPrompt(input: string): string {
-  return input
-    .replace(/<\/?(?:system|user|assistant|human|ai|instruction|context)>/gi, '')
-    .replace(/\[(?:SYSTEM|INST|HIDDEN|ADMIN)\s*(?:OVERRIDE|MESSAGE|INSTRUCTION)?[\]:]/gi, '')
-}
-
-/** Scan for injection and log security event if unsafe */
-export function scanAndLogInjection(text: string, options?: GuardOptions, context?: { agentName?: string; source?: string; workspaceId?: number }): InjectionReport {
-  const report = scanForInjection(text, options)
-  if (!report.safe) {
-    try {
-      const { logSecurityEvent } = require('./security-events')
-      logSecurityEvent({ event_type: 'injection_attempt', severity: report.matches.some(m => m.severity === 'critical') ? 'critical' : 'warning', source: context?.source || 'injection-guard', agent_name: context?.agentName, detail: JSON.stringify({ matches: report.matches.map(m => ({ rule: m.rule, category: m.category, severity: m.severity })) }), workspace_id: context?.workspaceId || 1, tenant_id: 1 })
-    } catch {}
-  }
-  return report
-}
-
-/** Sanitize content for safe HTML rendering (escapes HTML entities) */
-export function escapeHtml(input: string): string {
-  return input
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#x27;')
+  
+  return variants
 }

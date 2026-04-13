@@ -134,15 +134,38 @@ export async function POST(request: NextRequest) {
   ensureTable(db)
 
   let id: number | null = null
+  let explicitWsUrl: string | null = null
   try {
     const body = await request.json()
     id = Number(body?.id)
+    explicitWsUrl = typeof body?.explicitWsUrl === 'string' ? body.explicitWsUrl.trim() : null
   } catch {
     return NextResponse.json({ error: 'Invalid request body' }, { status: 400 })
   }
 
+  // ── Path A: explicit WebSocket URL passed directly (e.g. from connectWithEnvFallback) ──
+  if (explicitWsUrl) {
+    // Validate it looks like a ws:// or wss:// URL
+    try {
+      const parsed = new URL(explicitWsUrl)
+      if (!['ws:', 'wss:'].includes(parsed.protocol)) {
+        return NextResponse.json({ error: 'invalid URL protocol — must be ws: or wss:' }, { status: 400 })
+      }
+      // Return the URL as-is; token must come from the X-Gateway-Token header
+      const headerToken = request.headers.get('x-gateway-token') || ''
+      return NextResponse.json({
+        ws_url: explicitWsUrl,
+        token: headerToken,
+        token_set: headerToken.length > 0,
+      })
+    } catch {
+      return NextResponse.json({ error: 'invalid explicitWsUrl' }, { status: 400 })
+    }
+  }
+
+  // ── Path B: resolve URL from gateway ID (existing behaviour) ──
   if (!id || !Number.isInteger(id) || id < 1) {
-    return NextResponse.json({ error: 'id is required' }, { status: 400 })
+    return NextResponse.json({ error: 'id is required (when explicitWsUrl is not provided)' }, { status: 400 })
   }
 
   const gateway = db.prepare('SELECT id, host, port, token, is_primary FROM gateways WHERE id = ?').get(id) as GatewayEntry | undefined

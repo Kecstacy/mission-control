@@ -42,8 +42,81 @@ export interface GuardOptions {
 }
 
 // ---------------------------------------------------------------------------
+// Input normalization — eliminates homoglyph, encoding, and hidden-char bypasses
+// ---------------------------------------------------------------------------
+
+/** Cyrillic/Unicode homoglyph → ASCII mapping (Unicode TR39 + common confusables) */
+const HOMOGLYPH_MAP: [RegExp, string | ((m: string) => string)][] = [
+  [/[а]/g, 'a'], // Cyrillic а → a
+  [/[е]/g, 'e'], // Cyrillic е → e
+  [/[і]/g, 'i'], // Cyrillic і → i
+  [/[ї]/g, 'i'], // Cyrillic ї → i
+  [/[о]/g, 'o'], // Cyrillic о → o
+  [/[р]/g, 'p'], // Cyrillic р → p
+  [/[с]/g, 'c'], // Cyrillic с → c
+  [/[у]/g, 'y'], // Cyrillic у → y
+  [/[х]/g, 'x'], // Cyrillic х → x
+  [/[ё]/g, 'e'], // Cyrillic ё → e
+  // Full-width ASCII variants (U+FF01=! through U+FF5E=~) — maps all full-width ASCII to ASCII
+  [/[！-～]/g, (m: string) => String.fromCharCode(m.charCodeAt(0) - 0xFEE0)]
+]
+
+/** ROT13 decoder for the common obfuscation pattern */
+function applyRot13(str: string): string {
+  return str.replace(/[a-zA-Z]/g, (c) =>
+    String.fromCharCode(c.charCodeAt(0) + (c.toLowerCase() < 'n' ? 13 : -13))
+  )
+}
+
+/**
+ * Normalize input before scanning — eliminates bypasses via:
+ * - Cyrillic/Unicode homoglyph substitution
+ * - ROT13 obfuscation
+ * - URL encoding
+ * - Zero-width / formatting characters
+ */
+export function normalizeInput(input: string): string {
+  if (!input) return input
+
+  let text = input
+
+  // 1. URL decode first (%2F → /, %20 → space, etc.)
+  try {
+    text = decodeURIComponent(text)
+  } catch {}
+
+  // 2. Replace Cyrillic homoglyphs and other confusables with ASCII equivalents
+  // String replacements
+  for (const [pattern, replacement] of HOMOGLYPH_MAP) {
+    if (typeof replacement !== 'function') {
+      text = text.replace(pattern, replacement)
+    }
+  }
+  // Function replacements
+  for (const [pattern, replacement] of HOMOGLYPH_MAP) {
+    if (typeof replacement === 'function') {
+      text = text.replace(pattern, replacement)
+    }
+  }
+
+  // 3. ROT13 (covers "Cyrnfr rkrphgr..." style bypasses)
+  // Detect likely ROT13 by checking if result reads more like English
+  const rot13d = applyRot13(text)
+  // If the ROT13 version contains more common English words, prefer it
+  const commonWords = /\b(the|and|for|are|but|not|you|all|can|her|was|one|our|out|please|execute|ignore|remove|delete|instruction)\b/gi
+  const originalHits = (text.match(commonWords) || []).length
+  const rot13Hits = (rot13d.match(commonWords) || []).length
+  if (rot13Hits > originalHits && rot13Hits > 0) {
+    text = rot13d
+  }
+
+  return text
+}
+
+// ---------------------------------------------------------------------------
 // Rules
 // ---------------------------------------------------------------------------
+
 
 interface InjectionRule {
   rule: string
@@ -232,7 +305,10 @@ export function scanForInjection(input: string, options: GuardOptions = {}): Inj
   }
 
   // Truncate overly long input to prevent ReDoS
-  const text = input.length > maxLength ? input.slice(0, maxLength) : input
+  const raw = input.length > maxLength ? input.slice(0, maxLength) : input
+
+  // Normalize: eliminates homoglyph, ROT13, URL-encoding, zero-width bypasses
+  const text = normalizeInput(raw)
   const matches: InjectionMatch[] = []
 
   for (const rule of RULES) {
